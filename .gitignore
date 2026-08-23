@@ -1,0 +1,61 @@
+# ------------------------------------------------------------------
+# Node / Next.js
+# ------------------------------------------------------------------
+node_modules/
+.next/
+out/
+build/
+*.tsbuildinfo
+next-env.d.ts
+
+# ------------------------------------------------------------------
+# Environment & secrets — never commit real credentials
+# ------------------------------------------------------------------
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# ------------------------------------------------------------------
+# Private user data (reference photos + generated try-on images).
+# These live outside the web root and must never be published.
+# ------------------------------------------------------------------
+.data/
+
+# User-uploaded wardrobe photos. The demo assets in public/seed and
+# public/images ARE committed; real uploads are not.
+/public/uploads/
+
+# ------------------------------------------------------------------
+# Local VTON service: Python env, caches, model weights
+# ------------------------------------------------------------------
+vton-service/.venv/
+vton-service/venv/
+vton-service/__pycache__/
+vton-service/**/__pycache__/
+vton-service/output/
+vton-service/models/
+vton-service/checkpoints/
+**/*.py[cod]
+.python-version
+
+# CatVTON checkout, if placed inside the repo
+/CatVTON/
+
+# Model weights & HuggingFace cache (multiple GB — never commit)
+*.safetensors
+*.ckpt
+*.pth
+*.bin
+.cache/
+.huggingface/
+hf_cache/
+
+# ------------------------------------------------------------------
+# OS / editor noise
+# ------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/

@@ -1,0 +1,50 @@
+# ------------------------------------------------------------------
+# Dependencies for the LOCAL CatVTON try-on service.
+#
+# The service itself (server.py) needs NOTHING from this file — it runs
+# on the Python standard library and will report "model not installed".
+# Install these only when you want real generation.
+#
+# PyTorch is intentionally NOT pinned here: the correct wheel depends on
+# your GPU backend. Install it FIRST, from the right index:
+#
+#   NVIDIA (CUDA 12.1):
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+#
+#   AMD on Linux (ROCm 6.x — RDNA2 cards need HSA_OVERRIDE_GFX_VERSION=10.3.0):
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm6.2
+#
+#   CPU only (very slow — minutes per image):
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#
+# See the "Local Virtual Try-On" section of the main README.
+# ------------------------------------------------------------------
+
+# Core inference stack used by CatVTON
+diffusers==0.31.0
+transformers==4.44.2
+accelerate==0.33.0
+huggingface_hub>=0.24,<1.0
+safetensors>=0.4.2
+
+# Image handling
+Pillow>=10.0.0
+numpy<2.0
+opencv-python>=4.8.0
+scipy>=1.10.0
+
+# CatVTON utilities
+einops>=0.7.0
+av
+tqdm
+
+# ------------------------------------------------------------------
+# OPTIONAL — automatic garment masking (AutoMasker).
+#
+# CatVTON's automatic mask generation uses DensePose, which requires
+# detectron2. Without it the service still runs, but every request must
+# carry its own mask. detectron2 has no PyPI wheel and is painful on
+# Windows; see the README troubleshooting section.
+#
+#   pip install "git+https://github.com/facebookresearch/detectron2.git"
+# ------------------------------------------------------------------
