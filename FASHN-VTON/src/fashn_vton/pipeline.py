@@ -141,7 +141,11 @@ class TryOnPipeline:
         dwpose_dir = os.path.join(self.weights_dir, "dwpose")
         self.logger.info(f"Loading DWPose from {dwpose_dir}")
 
-        dwpose_device = f"cuda:{self.device.index or 0}" if self.device.type == "cuda" else "cpu"
+        dwpose_device = (
+            f"cuda:{self.device.index or 0}"
+            if self.device.type == "cuda"
+            else ("directml" if self.device.type == "privateuseone" else "cpu")
+        )
         self.pose_model = DWposeDetector(checkpoints_dir=dwpose_dir, device=dwpose_device)
 
         self.logger.info("DWPose loaded")
@@ -164,10 +168,10 @@ class TryOnPipeline:
         person_poses: torch.Tensor,
         garment_poses: torch.Tensor,
         garment_categories: torch.Tensor,
-        num_timesteps: int = 30,
+        num_timesteps: int = 20,
         time_shift_mu: float = 1.5,
         guidance_scale: float = 1.5,
-        skip_cfg_last_n_steps: int = 1,
+        skip_cfg_last_n_steps: int = 6,
         use_tqdm: bool = True,
     ) -> List[Image.Image]:
         """Euler sampling with CFG."""
@@ -190,6 +194,9 @@ class TryOnPipeline:
         }
 
         # Euler sampling loop
+        # Pre-allocate t_vec once; fill_ each step to avoid per-step GPU allocation.
+        t_vec = torch.empty((batch_size,), dtype=dtype, device=device)
+
         for step_idx, (t_curr, t_prev) in enumerate(
             tqdm(
                 zip(timesteps[:-1], timesteps[1:]),
@@ -199,7 +206,7 @@ class TryOnPipeline:
             )
         ):
             dt = t_prev - t_curr
-            t_vec = torch.full((batch_size,), t_curr, dtype=dtype, device=device)
+            t_vec.fill_(t_curr)
 
             # Skip CFG at final steps to prevent color saturation. When
             # this is true, v_u is never used below, so don't pay for
@@ -222,7 +229,7 @@ class TryOnPipeline:
                 v_u = pred["v_u"]
                 v_guided = v_u + guidance_scale * (v_c - v_u)
 
-            images = images + dt * v_guided
+            images.add_(v_guided, alpha=dt)
 
         images = images.to(dtype=torch.float).clamp_(-1.0, 1.0)
         return [tensor_to_pil(img, unnormalize=True) for img in images]
@@ -235,9 +242,9 @@ class TryOnPipeline:
         category: Literal["tops", "bottoms", "one-pieces"],
         garment_photo_type: Literal["model", "flat-lay"] = "model",
         num_samples: int = 1,
-        num_timesteps: int = 30,
+        num_timesteps: int = 20,
         guidance_scale: float = 1.5,
-        skip_cfg_last_n_steps: int = 1,
+        skip_cfg_last_n_steps: int = 6,
         seed: int = 42,
         segmentation_free: bool = True,
     ) -> PipelineOutput:
@@ -277,19 +284,30 @@ class TryOnPipeline:
         garment_image_np = np.array(garment_image)
 
         # Pose detection (DWPose expects BGR)
-        person_pose = self.pose_model(person_image_np[..., ::-1])
-        garment_pose = (
-            get_dummy_dw_keypoints()
-            if garment_photo_type == "flat-lay"
-            else self.pose_model(garment_image_np[..., ::-1])
-        )
+        if garment_photo_type == "flat-lay":
+            person_pose = self.pose_model(person_image_np[..., ::-1])
+            garment_pose = get_dummy_dw_keypoints()
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                f_person = executor.submit(self.pose_model, person_image_np[..., ::-1])
+                f_garment = executor.submit(self.pose_model, garment_image_np[..., ::-1])
+                person_pose = f_person.result()
+                garment_pose = f_garment.result()
 
         person_pose_img = draw_pose(person_pose, person_image_np.shape[0], person_image_np.shape[1], grayscale=True)
         garment_pose_img = draw_pose(garment_pose, garment_image_np.shape[0], garment_image_np.shape[1], grayscale=True)
 
-        # Human parsing
-        person_seg_pred = self.hp_model.predict(person_image_np)
-        garment_seg_pred = self.hp_model.predict(garment_image_np)
+        # Human parsing (only run when masking is actually needed)
+        person_seg_pred = None
+        if not segmentation_free:
+            self.logger.info("Running human parsing on person image...")
+            person_seg_pred = self.hp_model.predict(person_image_np)
+
+        garment_seg_pred = None
+        if garment_photo_type != "flat-lay":
+            self.logger.info("Running human parsing on garment image...")
+            garment_seg_pred = self.hp_model.predict(garment_image_np)
 
         # Get labels to segment based on category
         body_coverage = CATEGORY_TO_BODY_COVERAGE.get(category)
@@ -299,7 +317,7 @@ class TryOnPipeline:
         # Create clothing-agnostic and garment images
         ca_image = create_clothing_agnostic_image(
             img_np=person_image_np.copy(),
-            seg_pred=person_seg_pred.copy(),
+            seg_pred=person_seg_pred.copy() if person_seg_pred is not None else None,
             labels_to_segment_indices=labels_to_segment_indices.copy(),
             body_coverage=body_coverage,
             disable_masking=segmentation_free,
@@ -308,7 +326,7 @@ class TryOnPipeline:
 
         garment_image_processed = create_garment_image(
             img_np=garment_image_np,
-            seg_pred=garment_seg_pred,
+            seg_pred=garment_seg_pred if garment_seg_pred is not None else None,
             labels_to_segment_indices=labels_to_segment_indices.copy(),
             disable_masking=garment_photo_type == "flat-lay",
         )

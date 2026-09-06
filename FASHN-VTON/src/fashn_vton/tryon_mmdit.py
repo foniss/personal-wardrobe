@@ -31,7 +31,7 @@ def _attn_processor(
     q: Tensor,
     k: Tensor,
     v: Tensor,
-    chunk_size: int = 2048,
+    chunk_size: int = 3456,
 ) -> Tensor:
     """
     Memory-efficient scaled dot-product attention.
@@ -75,6 +75,8 @@ def _attn_processor(
 
         outputs.append(out_chunk)
 
+    if len(outputs) == 1:
+        return outputs[0]
     return torch.cat(outputs, dim=2)
 
 def attention(
@@ -673,22 +675,12 @@ class DoubleStreamBlock(nn.Module):
         # Apply RoPE separately to garment/text and image streams.
         # This avoids creating the old rank-6 PE tensor that DirectML cannot handle.
 
-        txt_q, txt_k = apply_rope(
-            txt_q,
-            txt_k,
-            pe[:, :txt.shape[1]],
-        )
-
-        img_q, img_k = apply_rope(
-            img_q,
-            img_k,
-            pe[:, txt.shape[1]:],
-        )
-
-        # Combine the two streams for joint attention.
+        # Combine the two streams for joint attention first, then apply RoPE once.
         q = torch.cat((txt_q, img_q), dim=2)
         k = torch.cat((txt_k, img_k), dim=2)
         v = torch.cat((txt_v, img_v), dim=2)
+
+        q, k = apply_rope(q, k, pe)
 
         # Run attention ONCE.
         attn = _attn_processor(q, k, v)
@@ -1464,6 +1456,13 @@ class TryOnModel(nn.Module):
             ),
         )
 
+        # Static embedding caches
+        self._cached_pe = None
+        self._cached_x_pe = None
+        self._cached_garment_key = None
+        self._cached_garment_cond = None
+        self._cached_garment_uncond = None
+
     # ======================================================================
     # CLASSIFIER FREE GUIDANCE
     # ======================================================================
@@ -1514,6 +1513,59 @@ class TryOnModel(nn.Module):
         # already computes one v_c/v_u pair per step either way).
         # ------------------------------------------------------------------
 
+        # ------------------------------------------------------------------
+        # PRECOMPUTE STATIC GARMENT TOKENS (cached across steps)
+        # ------------------------------------------------------------------
+        garment_images = kwargs.get("garment_images")
+        garment_poses = kwargs.get("garment_poses")
+        garment_cond = None
+        garment_uncond = None
+
+        if garment_images is not None and garment_poses is not None:
+            cache_key = (id(garment_images), id(garment_poses), batch_size, noisy_images.device)
+            if self._cached_garment_key == cache_key:
+                garment_cond = self._cached_garment_cond
+                garment_uncond = self._cached_garment_uncond
+            else:
+                # Precompute conditional garment tokens
+                g_cond = torch.cat([garment_images, garment_poses], dim=1)
+                g_cond = self.garment_embedder(g_cond)
+                garment_cond, _ = prepare(g_cond)
+
+                # Precompute unconditional garment tokens (all zeros)
+                g_uncond = torch.zeros_like(torch.cat([garment_images, garment_poses], dim=1))
+                g_uncond = self.garment_embedder(g_uncond)
+                garment_uncond, _ = prepare(g_uncond)
+
+                self._cached_garment_key = cache_key
+                self._cached_garment_cond = garment_cond
+                self._cached_garment_uncond = garment_uncond
+
+        # ------------------------------------------------------------------
+        # PRECOMPUTE TIMESTEP + CATEGORY VEC (shared across cond/uncond)
+        #
+        # The cond and uncond passes differ only in the conditioning tokens;
+        # the timestep and category embeddings are identical for both.  We
+        # compute them once in forward_for_cfg and inject via precomputed_vec
+        # so that forward() skips t_embedder / y_embedder on the uncond call.
+        # ------------------------------------------------------------------
+        times = args[1] if len(args) > 1 else kwargs.get("times")
+        garment_categories = kwargs.get("garment_categories")
+        precomputed_vec = None
+
+        if times is not None:
+            precomputed_vec = self.t_embedder(times)
+            if exists(self.guidance_embedder):
+                guidance = kwargs.get("guidance")
+                if exists(guidance):
+                    precomputed_vec = precomputed_vec + self.guidance_embedder(guidance)
+            if exists(self.y_embedder) and exists(garment_categories):
+                # For cond pass the mask is all-True so y is unchanged;
+                # for uncond pass the mask zeros it.  The null class index
+                # is n_classes (the extra embedding row added in __init__).
+                # We use the cond y here (same as mask=all-True path).
+                precomputed_vec = precomputed_vec + self.y_embedder(garment_categories)
+
         cond_mask = torch.ones(
             batch_size,
             device=noisy_images.device,
@@ -1524,6 +1576,8 @@ class TryOnModel(nn.Module):
             *args,
             **kwargs,
             mask=cond_mask,
+            precomputed_garment=garment_cond,
+            precomputed_vec=precomputed_vec,
         )["x"]
 
         # The caller (the sampling loop) knows in advance whether v_u
@@ -1544,10 +1598,29 @@ class TryOnModel(nn.Module):
             dtype=torch.bool,
         )
 
+        # For the uncond vec: the original code called apply_conditional_dropout
+        # on garment_categories with mask=all-False, which zeroes the integer
+        # tensor to produce category index 0 for every sample.  Replicate that
+        # here by embedding zeros (index 0) instead of the real category.
+        if exists(self.y_embedder) and exists(garment_categories) and precomputed_vec is not None:
+            uncond_vec = self.t_embedder(times)
+            if exists(self.guidance_embedder):
+                guidance = kwargs.get("guidance")
+                if exists(guidance):
+                    uncond_vec = uncond_vec + self.guidance_embedder(guidance)
+            # Original uncond: apply_conditional_dropout zeros the category
+            # tensor → index 0 for all samples.
+            null_y = torch.zeros_like(garment_categories)
+            uncond_vec = uncond_vec + self.y_embedder(null_y)
+        else:
+            uncond_vec = precomputed_vec
+
         null_logits = self.forward(
             *args,
             **kwargs,
             mask=uncond_mask,
+            precomputed_garment=garment_uncond,
+            precomputed_vec=uncond_vec,
         )["x"]
 
         return {
@@ -1570,6 +1643,8 @@ class TryOnModel(nn.Module):
         mask: Optional[torch.Tensor] = None,
         guidance: Optional[torch.Tensor] = None,
         garment_categories: Optional[torch.Tensor] = None,
+        precomputed_garment: Optional[torch.Tensor] = None,
+        precomputed_vec: Optional[torch.Tensor] = None,
     ):
 
         # ==================================================================
@@ -1617,68 +1692,76 @@ class TryOnModel(nn.Module):
 
         # Garment conditioning.
 
-        garment_poses = apply_conditional_dropout(
-            garment_poses,
-            mask,
-        )
-
-        garment_images = apply_conditional_dropout(
-            garment_images,
-            mask,
-        )
-
-        garment_images = torch.cat(
-            [
-                garment_images,
+        if precomputed_garment is not None:
+            garment_images = precomputed_garment
+        else:
+            garment_poses = apply_conditional_dropout(
                 garment_poses,
-            ],
-            dim=1,
-        )
+                mask,
+            )
 
-        garment_images = self.garment_embedder(
-            garment_images
-        )
+            garment_images = apply_conditional_dropout(
+                garment_images,
+                mask,
+            )
 
-        garment_images, garment_ids = prepare(
-            garment_images
-        )
+            garment_images = torch.cat(
+                [
+                    garment_images,
+                    garment_poses,
+                ],
+                dim=1,
+            )
+
+            garment_images = self.garment_embedder(
+                garment_images
+            )
+
+            garment_images, _ = prepare(
+                garment_images
+            )
 
         # ==================================================================
         # TIME & MODULATION
         # ==================================================================
 
-        t = self.t_embedder(times)
+        if precomputed_vec is not None:
+            # Caller (forward_for_cfg) already computed t_embedder + y_embedder
+            # for this pass; reuse it to avoid redundant embedding lookups.
+            t = precomputed_vec
+        else:
+            t = self.t_embedder(times)
 
-        if exists(self.guidance_embedder):
+            if exists(self.guidance_embedder):
 
-            assert exists(guidance), (
-                "Guidance scale required for guidance distilled model"
-            )
-
-            t = (
-                t
-                + self.guidance_embedder(
-                    guidance
+                assert exists(guidance), (
+                    "Guidance scale required for guidance distilled model"
                 )
-            )
 
-        if exists(self.y_embedder):
+                t = (
+                    t
+                    + self.guidance_embedder(
+                        guidance
+                    )
+                )
 
-            assert exists(
-                garment_categories
-            ), (
-                "Category labels required for y_embedder"
-            )
+            if exists(self.y_embedder):
 
-            y = apply_conditional_dropout(
-                garment_categories,
-                mask,
-            )
+                assert exists(
+                    garment_categories
+                ), (
+                    "Category labels required for y_embedder"
+                )
 
-            t = (
-                t
-                + self.y_embedder(y)
-            )
+                y = apply_conditional_dropout(
+                    garment_categories,
+                    mask,
+                )
+
+                t = (
+                    t
+                    + self.y_embedder(y)
+                )
 
         # ==================================================================
         # POSITIONAL EMBEDDINGS
@@ -1688,46 +1771,42 @@ class TryOnModel(nn.Module):
         txt = garment_images
         vec = t
 
-        # ------------------------------------------------------------------
-        # IMPORTANT DIRECTML FIX
-        #
-        # We can safely concatenate IDs because they are only rank-3:
-        #
-        # [B, L, 3]
-        #
-        # EmbedND now returns:
-        #
-        # [B, L, 64, 2]
-        #
-        # rather than the old rank-6 representation.
-        # ------------------------------------------------------------------
+        # Check cached positional embeddings
+        if (
+            self._cached_pe is not None
+            and self._cached_pe.shape[0] == batch_size
+            and self._cached_pe.device == device
+        ):
+            pe = self._cached_pe
+            x_pe = self._cached_x_pe
+        else:
+            combined_ids = torch.cat(
+                [
+                    x_ids,
+                    x_ids,
+                ],
+                dim=1,
+            )
 
-        combined_ids = torch.cat(
-            [
-                x_ids,
-                garment_ids,
-            ],
-            dim=1,
-        )
+            pe = self.pe_embedder(
+                combined_ids
+            )
 
-        pe = self.pe_embedder(
-            combined_ids
-        )
+            x_pe = (
+                self.pe_embedder(x_ids)
+                if self.use_patch_mixer
+                else None
+            )
+
+            self._cached_pe = pe
+            self._cached_x_pe = x_pe
 
         # ==================================================================
         # PATCH MIXER
         # ==================================================================
 
         if self.use_patch_mixer:
-
-            # Only image tokens go through the patch mixer.
-
-            x_pe = self.pe_embedder(
-                x_ids
-            )
-
             for block in self.x_patch_mixer:
-
                 img = block(
                     img,
                     vec=vec,

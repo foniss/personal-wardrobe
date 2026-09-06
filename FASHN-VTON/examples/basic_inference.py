@@ -55,7 +55,7 @@ Example:
     parser.add_argument(
         "--num-timesteps",
         type=int,
-        default=30,
+        default=20,
         help="Diffusion steps: 20=fast, 30=balanced, 50=quality",
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")

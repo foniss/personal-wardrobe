@@ -14,10 +14,14 @@ from .onnxpose import inference_pose
 
 class Wholebody:
     def __init__(self, checkpoints_dir, device="cuda:0"):
-        if device.startswith("cuda"):
-            device_id = int(device.split(":")[-1])
+        available_providers = ort.get_available_providers()
+        if device.startswith("cuda") and "CUDAExecutionProvider" in available_providers:
+            device_id = int(device.split(":")[-1]) if ":" in device else 0
             provider_options = [{"device_id": str(device_id)}]
             providers = ["CUDAExecutionProvider"]
+        elif (device in ("directml", "dml") or "privateuseone" in str(device)) and "DmlExecutionProvider" in available_providers:
+            providers = ["DmlExecutionProvider", "CPUExecutionProvider"]
+            provider_options = None
         else:
             providers = ["CPUExecutionProvider"]
             provider_options = None
