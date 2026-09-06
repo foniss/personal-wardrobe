@@ -54,8 +54,8 @@ class Config:
             "CATVTON_BASE_MODEL", "botp/stable-diffusion-v1-5-inpainting"
         )
     )
-    width: int = field(default_factory=lambda: _env_int("CATVTON_WIDTH", 768))
-    height: int = field(default_factory=lambda: _env_int("CATVTON_HEIGHT", 1024))
+    width: int = field(default_factory=lambda: _env_int("CATVTON_WIDTH", 512))
+    height: int = field(default_factory=lambda: _env_int("CATVTON_HEIGHT", 768))
     mixed_precision: str = field(
         default_factory=lambda: _env("CATVTON_MIXED_PRECISION", "bf16")
     )
@@ -67,9 +67,41 @@ class Config:
     )
     # Preload the model at service start instead of on first request.
     eager: bool = field(default_factory=lambda: _env_bool("CATVTON_EAGER_LOAD", False))
+    # VAE memory optimisations (both enabled by default).
+    vae_slicing: bool = field(default_factory=lambda: _env_bool("CATVTON_VAE_SLICING", True))
+    vae_tiling: bool = field(default_factory=lambda: _env_bool("CATVTON_VAE_TILING", True))
+    # Chunked attention — thresholds mirror values in attn_processor.py.
+    attn_chunk_threshold: int = field(
+        default_factory=lambda: _env_int("CATVTON_ATTN_CHUNK_THRESHOLD", 4096)
+    )
+    attn_chunk_size: int = field(
+        default_factory=lambda: _env_int("CATVTON_ATTN_CHUNK_SIZE", 1024)
+    )
 
 
 CONFIG = Config()
+
+
+# --------------------------------------------------------------------- helpers
+
+
+def _vram_str() -> str:
+    """Return a human-readable free/total VRAM string, or empty string."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            free, total = torch.cuda.mem_get_info(0)
+            return f"{free / 1024**3:.2f}/{total / 1024**3:.2f} GB free"
+    except Exception:
+        pass
+    return ""
+
+
+def _log(msg: str) -> None:
+    """Timestamped log to stdout, flushed immediately."""
+    import time as _time
+    ts = _time.strftime("%H:%M:%S")
+    print(f"[catvton {ts}] {msg}", flush=True)
 
 MODEL_VERSION = "catvton-1.0"
 
@@ -228,6 +260,10 @@ class CatVTONRunner:
             "base_model": CONFIG.base_model,
             "resolution": f"{CONFIG.width}x{CONFIG.height}",
             "mixed_precision": CONFIG.mixed_precision,
+            "vae_slicing": CONFIG.vae_slicing,
+            "vae_tiling": CONFIG.vae_tiling,
+            "attn_chunk_threshold": CONFIG.attn_chunk_threshold,
+            "attn_chunk_size": CONFIG.attn_chunk_size,
         }
 
     # ---------------------------------------------------------------- loading
@@ -292,18 +328,44 @@ class CatVTONRunner:
             ) from exc
 
         # Downloads on first run (several GB), cached afterwards in HF_HOME.
+        _log("Checking / downloading model weights…")
         repo_path = snapshot_download(repo_id=CONFIG.repo_id)
         self._repo_path = repo_path
+
+        weight_dtype = init_weight_dtype(CONFIG.mixed_precision)
+
+        # ---- Log configuration before heavy load ----
+        _log("=" * 60)
+        _log(f"Device          : {device}")
+        _log(f"Resolution      : {CONFIG.width}x{CONFIG.height}")
+        _log(f"Mixed precision : {CONFIG.mixed_precision} ({weight_dtype})")
+        _log(f"Attn backend    : chunked-math (threshold={CONFIG.attn_chunk_threshold}, "
+             f"chunk={CONFIG.attn_chunk_size}) | fast-SDPA for seq<={CONFIG.attn_chunk_threshold}")
+        _log(f"VAE slicing     : {CONFIG.vae_slicing}")
+        _log(f"VAE tiling      : {CONFIG.vae_tiling}")
+        _log(f"VRAM at load    : {_vram_str()}")
+        _log("=" * 60)
 
         self._pipeline = CatVTONPipeline(
             base_ckpt=CONFIG.base_model,
             attn_ckpt=repo_path,
             attn_ckpt_version="mix",
-            weight_dtype=init_weight_dtype(CONFIG.mixed_precision),
+            weight_dtype=weight_dtype,
             use_tf32=True,
             device=device,
         )
         self._device = device
+
+        # ---- VAE memory optimisations ----
+        if CONFIG.vae_slicing:
+            self._pipeline.vae.enable_slicing()
+            _log("VAE slicing enabled.")
+        if CONFIG.vae_tiling:
+            self._pipeline.vae.enable_tiling()
+            _log("VAE tiling enabled.")
+
+        _log(f"Model loaded. VRAM after load : {_vram_str()}")
+
         self._mask_processor = VaeImageProcessor(
             vae_scale_factor=8,
             do_normalize=False,
@@ -323,10 +385,9 @@ class CatVTONRunner:
             )
         except Exception as exc:  # detectron2 missing, etc.
             self._automasker = None
-            print(
-                f"[catvton] AutoMasker unavailable ({exc.__class__.__name__}: {exc}). "
-                "Automatic garment masking is disabled; requests must supply a mask.",
-                flush=True,
+            _log(
+                f"AutoMasker unavailable ({exc.__class__.__name__}: {exc}). "
+                "Automatic garment masking disabled; requests must supply a mask."
             )
 
     # -------------------------------------------------------------- inference
@@ -349,6 +410,13 @@ class CatVTONRunner:
 
         import torch  # safe: load() succeeded
         from utils import resize_and_crop, resize_and_padding  # type: ignore
+
+        _log(
+            f"try_on: cloth_type={cloth_type}, steps={steps or CONFIG.steps}, "
+            f"guidance={guidance if guidance is not None else CONFIG.guidance}, "
+            f"seed={seed}, resolution={CONFIG.width}x{CONFIG.height}"
+        )
+        _log(f"VRAM before inference : {_vram_str()}")
 
         person = resize_and_crop(person_image, (CONFIG.width, CONFIG.height))
         garment = resize_and_padding(garment_image, (CONFIG.width, CONFIG.height))
@@ -377,7 +445,11 @@ class CatVTONRunner:
             num_inference_steps=int(steps or CONFIG.steps),
             guidance_scale=float(guidance if guidance is not None else CONFIG.guidance),
             generator=generator,
+            height=CONFIG.height,
+            width=CONFIG.width,
         )[0]
+
+        _log(f"try_on: inference complete. VRAM after inference : {_vram_str()}")
         return result
 
 

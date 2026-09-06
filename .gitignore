@@ -27,8 +27,12 @@ next-env.d.ts
 /public/uploads/
 
 # ------------------------------------------------------------------
-# Local VTON service: Python env, caches, model weights
+# Python virtual environments (root & nested)
 # ------------------------------------------------------------------
+.venv/
+.venv*/
+venv/
+venv*/
 vton-service/.venv/
 vton-service/venv/
 vton-service/__pycache__/
@@ -42,14 +46,29 @@ vton-service/checkpoints/
 # CatVTON checkout, if placed inside the repo
 /CatVTON/
 
-# Model weights & HuggingFace cache (multiple GB — never commit)
+# Model weights, ONNX models & HuggingFace cache (multiple GB — never commit)
 *.safetensors
 *.ckpt
 *.pth
+*.pt
 *.bin
+*.onnx
+weights/
+**/weights/
 .cache/
 .huggingface/
 hf_cache/
+
+# Local test outputs, debug artifacts & backups
+repomix-output.xml
+outputs/
+**/outputs/
+debug_outputs/
+test_outputs/
+test_outputs_*/
+fashn_vton_git_standalone/
+.git_backup/
+**/.git_backup/
 
 # ------------------------------------------------------------------
 # OS / editor noise
